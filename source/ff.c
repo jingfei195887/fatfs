@@ -942,8 +942,10 @@ static FRESULT chk_lock (	/* Check if the file can be accessed */
 		return (!be && acc != 2) ? FR_TOO_MANY_OPEN_FILES : FR_OK;	/* Is there a blank entry for new object? */
 	}
 
-	/* The object was opened. Reject any open against writing file and all write mode open */
-	return (acc != 0 || Files[i].ctr == 0x100) ? FR_LOCKED : FR_OK;
+	/* The object was opened. Reject write/delete against an open file,
+	 * but allow read access to coexist with a writer.
+	 */
+	return (acc != 0) ? FR_LOCKED : FR_OK;
 }
 
 
@@ -979,31 +981,40 @@ static UINT inc_lock (	/* Increment object open counter and returns its index (0
 		Files[i].ctr = 0;
 	}
 
-	if (acc >= 1 && Files[i].ctr) return 0;	/* Access violation (int err) */
-
-	Files[i].ctr = acc ? 0x100 : Files[i].ctr + 1;	/* Set semaphore value */
+	/* ctr encoding: bit15 = writer flag, bit14..0 = reader count.
+	 * Writer flag and reader count occupy disjoint bit fields so
+	 * they can coexist without mutual corruption.
+	 */
+	if (acc) {					/* Write/delete open */
+		if (Files[i].ctr & 0x8000) return 0;	/* Writer already present */
+		Files[i].ctr |= 0x8000;
+	} else {					/* Read open */
+		if ((Files[i].ctr & 0x7FFF) == 0x7FFF) return 0;	/* Reader count saturated */
+		Files[i].ctr++;
+	}
 
 	return i + 1;	/* Index number origin from 1 */
 }
 
 
 static FRESULT dec_lock (	/* Decrement object open counter */
-	UINT i			/* Semaphore index (1..) */
+	UINT i,			/* Semaphore index (1..) */
+	int acc			/* Access type held by caller (0:Read, 1:Write/Delete) */
 )
 {
-	WORD n;
 	FRESULT res;
 
 
 	if (--i < FF_FS_LOCK) {	/* Index number origin from 0 */
-		n = Files[i].ctr;
-		if (n == 0x100) n = 0;	/* If write mode open, delete the entry */
-		if (n > 0) n--;			/* Decrement read mode open count */
-		Files[i].ctr = n;
-		if (n == 0) Files[i].fs = 0;	/* Delete the entry if open count gets zero */
+		if (acc) {					/* Writer close */
+			Files[i].ctr &= ~0x8000;		/* Clear writer flag */
+		} else if ((Files[i].ctr & 0x7FFF) > 0) {	/* Reader close */
+			Files[i].ctr--;				/* Decrement reader count */
+		}
+		if (Files[i].ctr == 0) Files[i].fs = 0;	/* Delete the entry if no holder remains */
 		res = FR_OK;
 	} else {
-		res = FR_INT_ERR;		/* Invalid index nunber */
+		res = FR_INT_ERR;		/* Invalid index number */
 	}
 	return res;
 }
@@ -3911,7 +3922,8 @@ FRESULT f_open (
 					}
 				}
 #if FF_FS_LOCK != 0
-				if (res != FR_OK) dec_lock(fp->obj.lockid); /* Decrement file open counter if seek failed */
+				if (res != FR_OK) dec_lock(fp->obj.lockid,
+						(mode & ~FA_READ) ? 1 : 0); /* Decrement file open counter if seek failed */
 #endif
 			}
 #endif
@@ -4249,7 +4261,8 @@ FRESULT f_close (
 		res = validate(&fp->obj, &fs);	/* Lock volume */
 		if (res == FR_OK) {
 #if FF_FS_LOCK != 0
-			res = dec_lock(fp->obj.lockid);		/* Decrement file open counter */
+			res = dec_lock(fp->obj.lockid,
+					(fp->flag & ~FA_READ) ? 1 : 0);	/* Decrement file open counter */
 			if (res == FR_OK) fp->obj.fs = 0;	/* Invalidate file object */
 #else
 			fp->obj.fs = 0;	/* Invalidate file object */
@@ -4689,7 +4702,7 @@ FRESULT f_closedir (
 	res = validate(&dp->obj, &fs);	/* Check validity of the file object */
 	if (res == FR_OK) {
 #if FF_FS_LOCK != 0
-		if (dp->obj.lockid) PRINT_RES(fs, dec_lock(dp->obj.lockid));	/* Decrement sub-directory open counter */
+		if (dp->obj.lockid) PRINT_RES(fs, dec_lock(dp->obj.lockid, 0));	/* Decrement sub-directory open counter */
 		if (res == FR_OK) dp->obj.fs = 0;	/* Invalidate directory object */
 #else
 		dp->obj.fs = 0;	/* Invalidate directory object */
