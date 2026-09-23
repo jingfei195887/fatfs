@@ -4237,6 +4237,22 @@ FRESULT f_sync (
 	LEAVE_FF(fs, res);
 }
 
+
+
+
+/*-----------------------------------------------------------------------*/
+/* Flush Cached Data of a Mounted Volume                                 */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_syncfs (
+	FATFS* fs		/* Mounted volume to be synced */
+)
+{
+	if (fs == 0 || fs->fs_type == 0) return FR_INVALID_OBJECT;	/* Not mounted */
+
+	return sync_fs(fs);		/* Flush volume window, FSInfo/bitmap and lower layer */
+}
+
 #endif /* !FF_FS_READONLY */
 
 
