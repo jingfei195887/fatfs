@@ -209,6 +209,7 @@ typedef struct {
 #endif
 #if FF_FS_LOCK
 	UINT	lockid;			/* File lock ID origin from 1 (index of file semaphore table Files[]) */
+	UINT	lockgen;		/* Generation of the shared allocation info last adopted */
 #endif
 } FFOBJID;
 

@@ -293,7 +293,18 @@ typedef struct {
 	DWORD clu;		/* Object ID 2, containing directory (0:root) */
 	DWORD ofs;		/* Object ID 3, offset in the directory */
 	WORD ctr;		/* Object open counter, 0:none, 0x01..0xFF:read mode open count, 0x100:write mode */
+	BYTE flag;		/* Share status flags (FSEM_VALID, FSEM_UNLINKED) */
+	BYTE stat;		/* Shared object chain status (exFAT) */
+	UINT gen;		/* Generation of the shared info, incremented on every change (never 0 once valid) */
+	DWORD sclust;	/* Shared object data start cluster */
+	FSIZE_t objsize;/* Shared object size */
+#if FF_FS_EXFAT
+	DWORD n_cont;	/* Shared size of first fragment - 1 (exFAT, valid when stat == 3) */
+#endif
 } FILESEM;
+
+#define FSEM_VALID		0x01	/* Shared allocation info is valid */
+#define FSEM_UNLINKED	0x02	/* Directory entry has been removed, release clusters on last close */
 #endif
 
 
@@ -920,41 +931,49 @@ static void unlock_fs (
 /* File lock control functions                                           */
 /*-----------------------------------------------------------------------*/
 
-static FRESULT chk_lock (	/* Check if the file can be accessed */
-	DIR* dp,		/* Directory object pointing the file to be checked */
-	int acc			/* Desired access type (0:Read mode open, 1:Write mode open, 2:Delete or rename) */
-)
-{
-	UINT i, be;
-
-	/* Search open object table for the object */
-	be = 0;
-	for (i = 0; i < FF_FS_LOCK; i++) {
-		if (Files[i].fs) {	/* Existing entry */
-			if (Files[i].fs == dp->obj.fs &&	 	/* Check if the object matches with an open object */
-				Files[i].clu == dp->obj.sclust &&
-				Files[i].ofs == dp->dptr) break;
-		} else {			/* Blank entry */
-			be = 1;
-		}
-	}
-	if (i == FF_FS_LOCK) {	/* The object has not been opened */
-		return (!be && acc != 2) ? FR_TOO_MANY_OPEN_FILES : FR_OK;	/* Is there a blank entry for new object? */
-	}
-
-	/* The object was opened. Reject write/delete against an open file,
-	 * but allow read access to coexist with a writer.
-	 */
-	return (acc != 0) ? FR_LOCKED : FR_OK;
-}
-
-
 static int enq_lock (void)	/* Check if an entry is available for a new object */
 {
 	UINT i;
 
 	for (i = 0; i < FF_FS_LOCK && Files[i].fs; i++) ;
 	return (i == FF_FS_LOCK) ? 0 : 1;
+}
+
+
+static UINT find_lock (	/* Find lock entry of the object (0:Not opened, >0:Index of Files[] origin from 1) */
+	DIR* dp			/* Directory object pointing the file to be searched */
+)
+{
+	UINT i;
+
+	for (i = 0; i < FF_FS_LOCK; i++) {
+		if (Files[i].fs == dp->obj.fs &&	 	/* Check if the object matches with an open object */
+			!(Files[i].flag & FSEM_UNLINKED) &&	/* Unlinked entries no longer have a name to match */
+			Files[i].clu == dp->obj.sclust &&
+			Files[i].ofs == dp->dptr) return i + 1;
+	}
+	return 0;
+}
+
+
+static FRESULT chk_lock (	/* Check if the file can be accessed */
+	DIR* dp,		/* Directory object pointing the file to be checked */
+	int acc			/* Desired access type (0:Read mode open, 1:Write mode open, 2:Delete or rename) */
+)
+{
+	UINT i;
+
+	i = find_lock(dp);		/* Search open object table for the object */
+	if (i == 0) {			/* The object has not been opened */
+		return (!enq_lock() && acc != 2) ? FR_TOO_MANY_OPEN_FILES : FR_OK;	/* Is there a blank entry for new object? */
+	}
+
+	/* The object was opened. Reject delete/rename and a second writer,
+	 * but allow read and write access to coexist (Linux-like behavior).
+	 */
+	if (acc == 2) return FR_LOCKED;
+	if (acc == 1 && (Files[i - 1].ctr & 0x8000)) return FR_LOCKED;
+	return FR_OK;
 }
 
 
@@ -966,20 +985,18 @@ static UINT inc_lock (	/* Increment object open counter and returns its index (0
 	UINT i;
 
 
-	for (i = 0; i < FF_FS_LOCK; i++) {	/* Find the object */
-		if (Files[i].fs == dp->obj.fs
-		 && Files[i].clu == dp->obj.sclust
-		 && Files[i].ofs == dp->dptr) break;
-	}
-
-	if (i == FF_FS_LOCK) {			/* Not opened. Register it as new. */
+	i = find_lock(dp);				/* Find the object */
+	if (i == 0) {					/* Not opened. Register it as new. */
 		for (i = 0; i < FF_FS_LOCK && Files[i].fs; i++) ;
 		if (i == FF_FS_LOCK) return 0;	/* No free entry to register (int err) */
 		Files[i].fs = dp->obj.fs;
 		Files[i].clu = dp->obj.sclust;
 		Files[i].ofs = dp->dptr;
 		Files[i].ctr = 0;
+		Files[i].flag = 0;			/* Shared allocation info is not valid yet */
+		i++;
 	}
+	i--;
 
 	/* ctr encoding: bit15 = writer flag, bit14..0 = reader count.
 	 * Writer flag and reader count occupy disjoint bit fields so
@@ -1011,7 +1028,10 @@ static FRESULT dec_lock (	/* Decrement object open counter */
 		} else if ((Files[i].ctr & 0x7FFF) > 0) {	/* Reader close */
 			Files[i].ctr--;				/* Decrement reader count */
 		}
-		if (Files[i].ctr == 0) Files[i].fs = 0;	/* Delete the entry if no holder remains */
+		if (Files[i].ctr == 0) {	/* Delete the entry if no holder remains */
+			Files[i].fs = 0;
+			Files[i].flag = 0;
+		}
 		res = FR_OK;
 	} else {
 		res = FR_INT_ERR;		/* Invalid index number */
@@ -1027,8 +1047,107 @@ static void clear_lock (	/* Clear lock entries of the volume */
 	UINT i;
 
 	for (i = 0; i < FF_FS_LOCK; i++) {
-		if (Files[i].fs == fs) Files[i].fs = 0;
+		if (Files[i].fs == fs) {
+			Files[i].fs = 0;
+			Files[i].flag = 0;
+		}
 	}
+}
+
+
+static void share_commit (	/* Publish changes made to the file to the other open handles */
+	FIL* fp		/* File object that changed the file */
+)
+{
+	FILESEM *flk;
+
+	if (fp->obj.lockid == 0 || fp->obj.lockid > FF_FS_LOCK) return;
+	flk = &Files[fp->obj.lockid - 1];
+	flk->sclust = fp->obj.sclust;
+	flk->objsize = fp->obj.objsize;
+	flk->stat = fp->obj.stat;
+#if FF_FS_EXFAT
+	flk->n_cont = fp->obj.n_cont;
+#endif
+	if (++flk->gen == 0) flk->gen = 1;	/* Generation 0 is reserved as 'not adopted yet' */
+	fp->obj.lockgen = flk->gen;
+	flk->flag |= FSEM_VALID;
+#if !FF_FS_READONLY && !FF_FS_TINY
+	if ((flk->ctr & 0x7FFF) != 0 && (fp->flag & FA_DIRTY)) {	/* Readers are present, flush cached data so they can see it */
+		if (disk_write(fp->obj.fs->pdrv, fp->buf, fp->sect, 1) == RES_OK) {
+			fp->flag &= (BYTE)~FA_DIRTY;
+		}
+	}
+#endif
+}
+
+
+static int share_adopt (	/* Adopt changes made via another handle (0:Not changed, 1:Data changed, 2:Allocation changed) */
+	FIL* fp		/* File object to be refreshed */
+)
+{
+	FILESEM *flk;
+	int chg;
+
+	if (fp->obj.lockid == 0 || fp->obj.lockid > FF_FS_LOCK) return 0;
+	flk = &Files[fp->obj.lockid - 1];
+	if (!(flk->flag & FSEM_VALID)) {	/* First holder defines the shared info */
+		share_commit(fp);
+		return 0;
+	}
+	if (fp->obj.lockgen == flk->gen) return 0;	/* Not changed */
+
+	/* The file has been changed via another handle */
+	chg = 1;
+	if (flk->sclust != fp->obj.sclust || flk->objsize < fp->obj.objsize || flk->stat != fp->obj.stat) {
+		chg = 2;	/* The cluster chain has been truncated or re-allocated */
+#if !FF_FS_READONLY && !FF_FS_TINY
+		fp->flag &= (BYTE)~FA_DIRTY;	/* Discard sector cache, it may belong to a removed cluster chain */
+#endif
+	}
+	fp->sect = 0;					/* Invalidate current data sector */
+	fp->obj.sclust = flk->sclust;
+	fp->obj.objsize = flk->objsize;
+	fp->obj.stat = flk->stat;
+#if FF_FS_EXFAT
+	fp->obj.n_cont = flk->n_cont;
+	fp->obj.n_frag = 0;
+#endif
+	fp->obj.lockgen = flk->gen;
+	return chg;
+}
+
+
+static int chk_share_unlinked (	/* Check if the file has been unlinked (0:Linked, 1:Unlinked) */
+	FIL* fp		/* File object to be checked */
+)
+{
+	if (fp->obj.lockid == 0 || fp->obj.lockid > FF_FS_LOCK) return 0;
+	return (Files[fp->obj.lockid - 1].flag & FSEM_UNLINKED) ? 1 : 0;
+}
+
+
+static int chk_last_holder (	/* Check if the handle is the last holder of the file (0:No, 1:Yes) */
+	FIL* fp,	/* File object to be checked */
+	int acc		/* Access type held by the handle (0:Read, 1:Write) */
+)
+{
+	if (fp->obj.lockid == 0 || fp->obj.lockid > FF_FS_LOCK) return 0;
+	return Files[fp->obj.lockid - 1].ctr == (acc ? 0x8000 : 0x0001);
+}
+
+
+static int chk_dir_lock (	/* Check if the sub-directory is open (0:Not open, 1:Open) */
+	FATFS* fs,	/* Filesystem object */
+	DWORD dclst	/* Start cluster of the sub-directory */
+)
+{
+	UINT i;
+
+	for (i = 0; i < FF_FS_LOCK; i++) {	/* An open directory is registered with its own start cluster */
+		if (Files[i].fs == fs && Files[i].clu == dclst && Files[i].ofs == 0) return 1;
+	}
+	return 0;
 }
 
 #endif	/* FF_FS_LOCK != 0 */
@@ -1123,7 +1242,7 @@ static FRESULT sync_fs (	/* Returns FR_OK or FR_DISK_ERR */
 
 	PRINT_RES(fs, sync_window(fs));
 	if (res == FR_OK) {
-#ifdef FF_FS_EXFAT
+#if FF_FS_EXFAT
 		if (fs->fs_type == FS_EXFAT) {
 			PRINT_RES(fs, f_sync_bitmap(fs));
 			if (res != FR_OK) return res;
@@ -1243,6 +1362,40 @@ static DWORD get_fat (		/* 0xFFFFFFFF:Disk error, 1:Internal error, 2..0x7FFFFFF
 
 	return val;
 }
+
+
+
+
+#if FF_FS_LOCK != 0
+/*-----------------------------------------------------------------------*/
+/* File lock control - Synchronize a file object with the shared state   */
+/*-----------------------------------------------------------------------*/
+
+static FRESULT share_update (	/* FR_OK(0):succeeded, !=0:error */
+	FIL* fp		/* File object to be synchronized with changes made via other handles */
+)
+{
+	FATFS *fs = fp->obj.fs;
+	DWORD clst, bcs;
+	FSIZE_t ofs;
+
+	if (share_adopt(fp) != 2) return FR_OK;	/* No allocation change made via another handle */
+
+	/* The cluster chain has been replaced or truncated, re-derive the current cluster from fptr */
+	fp->clust = fp->obj.sclust;
+	if (fp->fptr > 0 && fp->fptr <= fp->obj.objsize && fp->obj.sclust != 0) {
+		bcs = (DWORD)fs->csize * SS(fs);	/* Cluster size in byte */
+		clst = fp->obj.sclust;				/* Follow the cluster chain */
+		for (ofs = fp->fptr; ofs > bcs; ofs -= bcs) {
+			clst = get_fat(&fp->obj, clst);
+			if (clst <= 1) return FR_INT_ERR;
+			if (clst == 0xFFFFFFFF) return FR_DISK_ERR;
+		}
+		fp->clust = clst;
+	}
+	return FR_OK;
+}
+#endif	/* FF_FS_LOCK != 0 */
 
 
 
@@ -3710,7 +3863,7 @@ FRESULT f_mount (
 	cfs = FatFs[vol];					/* Pointer to fs object */
 
 	if (cfs) {
-#ifdef FF_FS_EXFAT
+#if FF_FS_EXFAT
 		if (cfs->fs_type == FS_EXFAT) {
 			PRINT_RES(fs, free_bitmap(cfs));
 			if (res != FR_OK) return res;
@@ -3859,6 +4012,7 @@ FRESULT f_open (
 			fp->dir_ptr = dj.dir;
 #if FF_FS_LOCK != 0
 			fp->obj.lockid = inc_lock(&dj, (mode & ~FA_READ) ? 1 : 0);	/* Lock the file for this session */
+			fp->obj.lockgen = 0;	/* No shared info adopted yet */
 			if (fp->obj.lockid == 0) PRINT_RES(fs, FR_INT_ERR);
 #endif
 		}
@@ -3896,11 +4050,19 @@ FRESULT f_open (
 			fp->err = 0;		/* Clear error flag */
 			fp->sect = 0;		/* Invalidate current data sector */
 			fp->fptr = 0;		/* Set file pointer top of the file */
+#if FF_FS_LOCK != 0
+			if (mode & FA_CREATE_ALWAYS) {	/* File created or truncated, publish new allocation info */
+				share_commit(fp);
+			} else {
+				PRINT_RES(fs, share_update(fp));	/* Adopt changes made via other open handles */
+				if (res != FR_OK) dec_lock(fp->obj.lockid, (mode & ~FA_READ) ? 1 : 0);
+			}
+#endif
 #if !FF_FS_READONLY
 #if !FF_FS_TINY
 			memset(fp->buf, 0, SS(fs));	/* Clear sector buffer */
 #endif
-			if ((mode & FA_SEEKEND) && fp->obj.objsize > 0) {	/* Seek to end of file if FA_OPEN_APPEND is specified */
+			if (res == FR_OK && (mode & FA_SEEKEND) && fp->obj.objsize > 0) {	/* Seek to end of file if FA_OPEN_APPEND is specified */
 				fp->fptr = fp->obj.objsize;			/* Offset to seek */
 				bcs = (DWORD)fs->csize * SS(fs);	/* Cluster size in byte */
 				clst = fp->obj.sclust;				/* Follow the cluster chain */
@@ -3964,7 +4126,11 @@ FRESULT f_read (
 	res = validate(&fp->obj, &fs);				/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) LEAVE_FF(fs, res);	/* Check validity */
 	if (!(fp->flag & FA_READ)) LEAVE_FF(fs, FR_DENIED); /* Check access mode */
-	remain = fp->obj.objsize - fp->fptr;
+#if FF_FS_LOCK != 0
+	res = share_update(fp);		/* Adopt changes made via other open handles */
+	if (res != FR_OK) ABORT(fs, res);
+#endif
+	remain = (fp->fptr < fp->obj.objsize) ? fp->obj.objsize - fp->fptr : 0;	/* fptr may exceed the file size if the file has been truncated via another handle */
 	if (btr > remain) btr = (UINT)remain;		/* Truncate btr by remaining bytes */
 
 	for ( ; btr > 0; btr -= rcnt, *br += rcnt, rbuff += rcnt, fp->fptr += rcnt) {	/* Repeat until btr bytes read */
@@ -4063,6 +4229,10 @@ FRESULT f_write (
 	res = validate(&fp->obj, &fs);			/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) LEAVE_FF(fs, res);	/* Check validity */
 	if (!(fp->flag & FA_WRITE)) LEAVE_FF(fs, FR_DENIED);	/* Check access mode */
+#if FF_FS_LOCK != 0
+	res = share_update(fp);		/* Adopt changes made via other open handles */
+	if (res != FR_OK) ABORT(fs, res);
+#endif
 
 	/* Check fptr wrap-around (file size cannot reach 4 GiB at FAT volume) */
 	if ((!FF_FS_EXFAT || fs->fs_type != FS_EXFAT) && (DWORD)(fp->fptr + btw) < (DWORD)fp->fptr) {
@@ -4154,6 +4324,9 @@ FRESULT f_write (
 	}
 
 	fp->flag |= FA_MODIFIED;				/* Set file change flag */
+#if FF_FS_LOCK != 0
+	share_commit(fp);						/* Publish new allocation info to other open handles */
+#endif
 
 	LEAVE_FF(fs, FR_OK);
 }
@@ -4182,6 +4355,13 @@ FRESULT f_sync (
 			if (fp->flag & FA_DIRTY) {	/* Write-back cached data if needed */
 				if (disk_write(fs->pdrv, fp->buf, fp->sect, 1) != RES_OK) LEAVE_FF(fs, FR_DISK_ERR);
 				fp->flag &= (BYTE)~FA_DIRTY;
+			}
+#endif
+#if FF_FS_LOCK != 0
+			if (chk_share_unlinked(fp)) {	/* The directory entry has been removed, just flush the volume */
+				PRINT_RES(fs, sync_fs(fs));
+				if (res == FR_OK) fp->flag &= (BYTE)~FA_MODIFIED;
+				LEAVE_FF(fs, res);
 			}
 #endif
 			/* Update the directory entry */
@@ -4268,6 +4448,10 @@ FRESULT f_close (
 {
 	FRESULT res;
 	FATFS *fs;
+#if FF_FS_LOCK != 0
+	FRESULT dres;
+	int acc;
+#endif
 
 #if !FF_FS_READONLY
 	PRINT_RES(fp->obj.fs, f_sync(fp));				/* Flush cached data */
@@ -4277,9 +4461,17 @@ FRESULT f_close (
 		res = validate(&fp->obj, &fs);	/* Lock volume */
 		if (res == FR_OK) {
 #if FF_FS_LOCK != 0
-			res = dec_lock(fp->obj.lockid,
-					(fp->flag & ~FA_READ) ? 1 : 0);	/* Decrement file open counter */
-			if (res == FR_OK) fp->obj.fs = 0;	/* Invalidate file object */
+			acc = (fp->flag & ~FA_READ) ? 1 : 0;
+			if (chk_share_unlinked(fp) && chk_last_holder(fp, acc)) {	/* Last close of an unlinked file (Linux-like deferred delete) */
+				share_adopt(fp);		/* Use up-to-date allocation info */
+				if (fp->obj.sclust != 0) {	/* Release the cluster chain */
+					PRINT_RES(fs, remove_chain(&fp->obj, fp->obj.sclust, 0));
+				}
+				if (res == FR_OK) PRINT_RES(fs, sync_fs(fs));
+			}
+			dres = dec_lock(fp->obj.lockid, acc);	/* Decrement file open counter */
+			if (res == FR_OK) res = dres;
+			if (dres == FR_OK) fp->obj.fs = 0;	/* Invalidate file object */
 #else
 			fp->obj.fs = 0;	/* Invalidate file object */
 #endif
@@ -4502,6 +4694,10 @@ FRESULT f_lseek (
 	}
 #endif
 	if (res != FR_OK) LEAVE_FF(fs, res);
+#if FF_FS_LOCK != 0
+	res = share_update(fp);				/* Adopt changes made via other open handles */
+	if (res != FR_OK) ABORT(fs, res);
+#endif
 
 #if FF_USE_FASTSEEK
 	if (fp->cltbl) {	/* Fast seek */
@@ -4630,6 +4826,9 @@ FRESULT f_lseek (
 			fp->sect = nsect;
 		}
 	}
+#if FF_FS_LOCK != 0 && !FF_FS_READONLY
+	if (fp->flag & FA_WRITE) share_commit(fp);	/* Publish allocation info in case the file has been expanded */
+#endif
 
 	LEAVE_FF(fs, res);
 }
@@ -4964,6 +5163,10 @@ FRESULT f_truncate (
 	res = validate(&fp->obj, &fs);	/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) LEAVE_FF(fs, res);
 	if (!(fp->flag & FA_WRITE)) LEAVE_FF(fs, FR_DENIED);	/* Check access mode */
+#if FF_FS_LOCK != 0
+	res = share_update(fp);		/* Adopt changes made via other open handles */
+	if (res != FR_OK) ABORT(fs, res);
+#endif
 
 	if (fp->fptr < fp->obj.objsize) {	/* Process when fptr is not on the eof */
 		if (fp->fptr == 0) {	/* When set file size to zero, remove entire cluster chain */
@@ -4990,6 +5193,9 @@ FRESULT f_truncate (
 		}
 #endif
 		if (res != FR_OK) ABORT(fs, res);
+#if FF_FS_LOCK != 0
+		share_commit(fp);	/* Publish new allocation info to other open handles */
+#endif
 	}
 
 	LEAVE_FF(fs, res);
@@ -5010,6 +5216,9 @@ FRESULT f_unlink (
 	DIR dj, sdj = { };
 	DWORD dclst = 0;
 	FATFS *fs;
+#if FF_FS_LOCK != 0
+	UINT lid = 0;
+#endif
 #if FF_FS_EXFAT
 	FFOBJID obj;
 #endif
@@ -5026,7 +5235,7 @@ FRESULT f_unlink (
 			PRINT_RES(fs, FR_INVALID_NAME);			/* Cannot remove dot entry */
 		}
 #if FF_FS_LOCK != 0
-		if (res == FR_OK) res = chk_lock(&dj, 2);	/* Check if it is an open object */
+		if (res == FR_OK) lid = find_lock(&dj);	/* Check if it is an open file */
 #endif
 		if (res == FR_OK) {					/* The object is accessible */
 			if (dj.fn[NSFLAG] & NS_NONAME) {
@@ -5048,6 +5257,11 @@ FRESULT f_unlink (
 					dclst = ld_clust(fs, dj.dir);
 				}
 				if (dj.obj.attr & AM_DIR) {			/* Is it a sub-directory? */
+#if FF_FS_LOCK != 0
+					if (chk_dir_lock(fs, dclst)) {	/* Cannot remove an open directory */
+						PRINT_RES(fs, FR_LOCKED);
+					} else
+#endif
 #if FF_FS_RPATH != 0
 					if (dclst == fs->cdir) {	 	/* Is it the current directory? */
 						PRINT_RES(fs, FR_DENIED);
@@ -5073,6 +5287,11 @@ FRESULT f_unlink (
 			}
 			if (res == FR_OK) {
 				PRINT_RES(fs, dir_remove(&dj));			/* Remove the directory entry */
+#if FF_FS_LOCK != 0
+				if (res == FR_OK && lid != 0) {		/* The file is open elsewhere, defer releasing */
+					Files[lid - 1].flag |= FSEM_UNLINKED;	/* the clusters until the last close (Linux-like) */
+				} else
+#endif
 				if (res == FR_OK && dclst != 0) {	/* Remove the cluster chain if exist */
 #if FF_FS_EXFAT
 					PRINT_RES(fs, remove_chain(&obj, dclst, 0));
@@ -5676,6 +5895,9 @@ FRESULT f_expand (
 				fs->free_clst -= tcl;
 				fs->fsi_flag |= 1;
 			}
+#if FF_FS_LOCK != 0
+			share_commit(fp);	/* Publish new allocation info to other open handles */
+#endif
 		}
 	}
 
@@ -5711,8 +5933,12 @@ FRESULT f_forward (
 	res = validate(&fp->obj, &fs);		/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) LEAVE_FF(fs, res);
 	if (!(fp->flag & FA_READ)) LEAVE_FF(fs, FR_DENIED);	/* Check access mode */
+#if FF_FS_LOCK != 0
+	res = share_update(fp);		/* Adopt changes made via other open handles */
+	if (res != FR_OK) ABORT(fs, res);
+#endif
 
-	remain = fp->obj.objsize - fp->fptr;
+	remain = (fp->fptr < fp->obj.objsize) ? fp->obj.objsize - fp->fptr : 0;	/* fptr may exceed the file size if the file has been truncated via another handle */
 	if (btf > remain) btf = (UINT)remain;			/* Truncate btf by remaining bytes */
 
 	for ( ; btf > 0 && (*func)(0, 0); fp->fptr += rcnt, *bf += rcnt, btf -= rcnt) {	/* Repeat until all data transferred or stream goes busy */
